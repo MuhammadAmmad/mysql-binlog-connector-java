@@ -30,12 +30,17 @@ import com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.GtidEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.QueryEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.RotateEventDataDeserializer;
-import com.github.shyiko.mysql.binlog.io.BufferedSocketInputStream;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 import com.github.shyiko.mysql.binlog.jmx.BinaryLogClientMXBean;
 import com.github.shyiko.mysql.binlog.network.AuthenticationException;
+import com.github.shyiko.mysql.binlog.network.ClientCapabilities;
+import com.github.shyiko.mysql.binlog.network.DefaultSSLSocketFactory;
+import com.github.shyiko.mysql.binlog.network.DefaultSocketFactory;
+import com.github.shyiko.mysql.binlog.network.SSLMode;
+import com.github.shyiko.mysql.binlog.network.SSLSocketFactory;
 import com.github.shyiko.mysql.binlog.network.ServerException;
 import com.github.shyiko.mysql.binlog.network.SocketFactory;
+import com.github.shyiko.mysql.binlog.network.TLSHostnameVerifier;
 import com.github.shyiko.mysql.binlog.network.protocol.ErrorPacket;
 import com.github.shyiko.mysql.binlog.network.protocol.GreetingPacket;
 import com.github.shyiko.mysql.binlog.network.protocol.Packet;
@@ -47,13 +52,19 @@ import com.github.shyiko.mysql.binlog.network.protocol.command.DumpBinaryLogComm
 import com.github.shyiko.mysql.binlog.network.protocol.command.DumpBinaryLogGtidCommand;
 import com.github.shyiko.mysql.binlog.network.protocol.command.PingCommand;
 import com.github.shyiko.mysql.binlog.network.protocol.command.QueryCommand;
+import com.github.shyiko.mysql.binlog.network.protocol.command.SSLRequestCommand;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.EOFException;
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
+import java.security.GeneralSecurityException;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
@@ -78,22 +89,31 @@ import java.util.logging.Logger;
  */
 public class BinaryLogClient implements BinaryLogClientMXBean {
 
-    private static final SocketFactory DEFAULT_SOCKET_FACTORY = new SocketFactory() {
+    private static final SocketFactory DEFAULT_SOCKET_FACTORY = new DefaultSocketFactory();
+    private static final SSLSocketFactory DEFAULT_REQUIRED_SSL_MODE_SOCKET_FACTORY = new DefaultSSLSocketFactory() {
 
         @Override
-        public Socket createSocket() throws SocketException {
-            return new Socket() {
+        protected void initSSLContext(SSLContext sc) throws GeneralSecurityException {
+            sc.init(null, new TrustManager[]{
+                new X509TrustManager() {
 
-                private InputStream inputStream;
+                    @Override
+                    public void checkClientTrusted(X509Certificate[] x509Certificates, String s)
+                        throws CertificateException { }
 
-                @Override
-                public synchronized InputStream getInputStream() throws IOException {
-                    return inputStream != null ? inputStream :
-                        (inputStream = new BufferedSocketInputStream(super.getInputStream()));
+                    @Override
+                    public void checkServerTrusted(X509Certificate[] x509Certificates, String s)
+                        throws CertificateException { }
+
+                    @Override
+                    public X509Certificate[] getAcceptedIssuers() {
+                        return new X509Certificate[0];
+                    }
                 }
-            };
+            }, null);
         }
     };
+    private static final SSLSocketFactory DEFAULT_VERIFY_CA_SSL_MODE_SOCKET_FACTORY = new DefaultSSLSocketFactory();
 
     private final Logger logger = Logger.getLogger(getClass().getName());
 
@@ -108,6 +128,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     private volatile String binlogFilename;
     private volatile long binlogPosition = 4;
     private volatile long connectionId;
+    private SSLMode sslMode = SSLMode.DISABLED;
 
     private volatile GtidSet gtidSet;
     private final Object gtidSetAccessLock = new Object();
@@ -118,6 +139,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     private final List<LifecycleListener> lifecycleListeners = new LinkedList<LifecycleListener>();
 
     private SocketFactory socketFactory;
+    private SSLSocketFactory sslSocketFactory;
 
     private PacketChannel channel;
     private volatile boolean connected;
@@ -185,6 +207,17 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
      */
     public void setBlocking(boolean blocking) {
         this.blocking = blocking;
+    }
+
+    public SSLMode getSSLMode() {
+        return sslMode;
+    }
+
+    public void setSSLMode(SSLMode sslMode) {
+        if (sslMode == null) {
+            throw new IllegalArgumentException("SSL mode cannot be NULL");
+        }
+        this.sslMode = sslMode;
     }
 
     /**
@@ -348,6 +381,13 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
     }
 
     /**
+     * @param sslSocketFactory custom ssl socket factory
+     */
+    public void setSslSocketFactory(SSLSocketFactory sslSocketFactory) {
+        this.sslSocketFactory = sslSocketFactory;
+    }
+
+    /**
      * @param threadFactory custom thread factory. If not provided, threads will be created using simple "new Thread()".
      */
     public void setThreadFactory(ThreadFactory threadFactory) {
@@ -367,7 +407,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         try {
             establishConnection();
             GreetingPacket greetingPacket = receiveGreeting();
-            authenticate(greetingPacket.getScramble(), greetingPacket.getServerCollation());
+            authenticate(greetingPacket);
             connectionId = greetingPacket.getThreadId();
             if (binlogFilename == null && gtidSet == null) {
                 autoPosition();
@@ -474,10 +514,30 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
         }
     }
 
-    private void authenticate(String salt, int collation) throws IOException {
-        AuthenticateCommand authenticateCommand = new AuthenticateCommand(schema, username, password, salt);
+    private void authenticate(GreetingPacket greetingPacket) throws IOException {
+        int collation = greetingPacket.getServerCollation();
+        int packetNumber = 1;
+        if (sslMode != SSLMode.DISABLED) {
+            boolean serverSupportsSSL = (greetingPacket.getServerCapabilities() & ClientCapabilities.SSL) != 0;
+            if (!serverSupportsSSL && (sslMode == SSLMode.REQUIRED || sslMode == SSLMode.VERIFY_CA ||
+                    sslMode == SSLMode.VERIFY_IDENTITY)) {
+                throw new IOException("MySQL server does not support SSL");
+            }
+            if (serverSupportsSSL) {
+                SSLRequestCommand sslRequestCommand = new SSLRequestCommand();
+                sslRequestCommand.setCollation(collation);
+                channel.write(sslRequestCommand, packetNumber++);
+                SSLSocketFactory sslSocketFactory = this.sslSocketFactory != null ? this.sslSocketFactory :
+                    sslMode == SSLMode.REQUIRED ? DEFAULT_REQUIRED_SSL_MODE_SOCKET_FACTORY :
+                        DEFAULT_VERIFY_CA_SSL_MODE_SOCKET_FACTORY;
+                channel.upgradeToSSL(sslSocketFactory,
+                    sslMode == SSLMode.VERIFY_IDENTITY ? new TLSHostnameVerifier() : null);
+            }
+        }
+        AuthenticateCommand authenticateCommand = new AuthenticateCommand(schema, username, password,
+            greetingPacket.getScramble());
         authenticateCommand.setCollation(collation);
-        channel.write(authenticateCommand);
+        channel.write(authenticateCommand, packetNumber);
         byte[] authenticationResult = channel.read();
         if (authenticationResult[0] == ErrorPacket.HEADER) {
             ErrorPacket errorPacket = new ErrorPacket(authenticationResult, 1);
@@ -650,6 +710,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
 
     private void listenForEventPackets() throws IOException {
         ByteArrayInputStream inputStream = channel.getInputStream();
+        boolean completeShutdown = false;
         try {
             while (inputStream.peek() != -1) {
                 int packetLength = inputStream.readInteger(3);
@@ -661,6 +722,7 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
                         errorPacket.getSqlState());
                 }
                 if (marker == (byte) 0xFE && !blocking) {
+                    completeShutdown = true;
                     break;
                 }
                 Event event;
@@ -697,7 +759,11 @@ public class BinaryLogClient implements BinaryLogClientMXBean {
             }
         } finally {
             if (isConnected()) {
-                disconnectChannel();
+                if (completeShutdown) {
+                    disconnect(); // initiate complete shutdown sequence (which includes keep alive thread)
+                } else {
+                    disconnectChannel();
+                }
             }
         }
     }
